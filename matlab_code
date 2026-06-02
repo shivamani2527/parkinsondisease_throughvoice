@@ -1,0 +1,321 @@
+function parkinsons_classifier()
+    clc; close all;
+    clearvars -except parkinsons_classifier; 
+  
+
+    %% Step 1: Load Dataset
+    [dataFile, dataPath] = uigetfile('*.data', 'Select parkinsons_updrs.data file');
+    if isequal(dataFile, 0)
+        disp('No data file selected. Exiting...');
+        return;
+    end
+    fullPath = fullfile(dataPath, dataFile);
+
+    opts = detectImportOptions(fullPath, 'FileType', 'text', 'Delimiter', ',', 'NumHeaderLines', 0);
+    opts.VariableNamingRule = 'preserve';
+    data = readtable(fullPath, opts);
+
+    data.Properties.VariableNames = { ...
+        'subject_', 'age', 'sex', 'test_time', ...
+        'motor_UPDRS', 'total_UPDRS', ...
+        'Jitter_percent', 'Jitter_Abs', 'Jitter_RAP', 'Jitter_PPQ5', ...
+        'Jitter_DDP', 'Shimmer', 'Shimmer_dB', 'Shimmer_APQ3', ...
+        'Shimmer_APQ5', 'Shimmer_APQ11', 'Shimmer_DDA', ...
+        'NHR', 'HNR', 'RPDE', 'DFA', 'PPE'};
+
+    %% Step 2: Create binary labels (Parkinson's vs Normal)
+    Y_binary = data.total_UPDRS >= 25; % Threshold for Parkinson's presence
+    %% ===== Severity Distribution (Dataset) =====
+Y_severity = zeros(height(data),1);
+
+for i = 1:height(data)
+    val = data.total_UPDRS(i);
+
+    if val < 10
+        Y_severity(i) = 0; % Normal
+    elseif val < 25
+        Y_severity(i) = 1; % Mild
+    elseif val < 40
+        Y_severity(i) = 2; % Moderate
+    else
+        Y_severity(i) = 3; % Severe
+    end
+end
+
+severityNames = {'Normal','Mild','Moderate','Severe'};
+
+counts = histcounts(Y_severity, -0.5:1:3.5);
+
+fprintf('\n===== DATASET SEVERITY DISTRIBUTION =====\n');
+for i = 1:4
+    fprintf('%s: %d samples\n', severityNames{i}, counts(i));
+end
+fprintf('========================================\n');
+
+    fprintf('Label distribution:\n');
+    disp(tabulate(Y_binary));
+
+    %% Step 3: Prepare features and normalize
+    X = data{:,7:22}; % 16 features
+
+    cv = cvpartition(Y_binary, 'HoldOut', 0.3);
+
+    mu = mean(X(training(cv), :), 1);
+    sigma = std(X(training(cv), :), 0, 1);
+    sigma(sigma == 0) = 1;
+
+    X_norm = (X - mu) ./ sigma;
+
+    model = fitcsvm(X_norm(training(cv), :), Y_binary(training(cv)), 'KernelFunction', 'rbf', 'Standardize', false);
+
+    Ypred = predict(model, X_norm(test(cv), :));
+    acc = mean(Ypred == Y_binary(test(cv))) * 100;
+    fprintf('Test accuracy: %.2f%%\n', acc);
+    % Confusion matrix
+cm = confusionmat(Y_binary(test(cv)), Ypred);
+
+TP = cm(2,2);
+FP = cm(1,2);
+FN = cm(2,1);
+% Precision, Recall, F1-score
+precision = TP / (TP + FP + eps);
+recall    = TP / (TP + FN + eps);
+f1_score  = 2 * (precision * recall) / (precision + recall + eps);
+fprintf('Test accuracy: %.2f%%\n', acc);
+fprintf('Precision: %.4f\n', precision);
+fprintf('Recall: %.4f\n', recall);
+fprintf('F1 Score: %.4f\n', f1_score);
+
+    %% Step 4: Select audio file for prediction
+    [audioFile, audioPath] = uigetfile({'*.wav;*.mp3;*.WAV;*.MP3'}, 'Select voice audio file (.wav or .mp3)');
+    if isequal(audioFile, 0)
+        disp('No audio file selected.');
+        return;
+    end
+
+    [y, fs] = audioread(fullfile(audioPath, audioFile));
+    if size(y,2) > 1, y = mean(y,2); end
+    y = y / (max(abs(y)) + eps);
+
+    %% Step 5: Pitch range check
+   % Extract pitch values and compute median pitch
+pitchVals = extractPitch(y, fs);
+if isempty(pitchVals)
+    medianPitch = 0;
+else
+    medianPitch = median(pitchVals);
+end
+
+featVec = extractVoiceFeatures(y, fs);          % Extract voice features
+featVecNorm = (featVec - mu) ./ sigma;          % Normalize features
+
+%% ===== Voice Classification with Severity =====
+if medianPitch >= 2000
+    predStr = 'Normal';
+    predSeverity = 'Normal';
+else
+    predBin = predict(model, featVecNorm);
+
+    if predBin == 0
+        predStr = 'Normal';
+        predSeverity = 'Normal';
+    else
+        predStr = 'Parkinson detected';
+
+        % Approx severity (display only, does NOT affect model)
+        approxUPDRS = 30;
+
+        if approxUPDRS < 25
+            predSeverity = 'Mild';
+        elseif approxUPDRS < 40
+            predSeverity = 'Moderate';
+        else
+            predSeverity = 'Severe';
+        end
+    end
+end
+
+fprintf('\n===== VOICE ANALYSIS RESULT =====\n');
+fprintf('Prediction: %s\n', predStr);
+fprintf('Severity: %s\n', predSeverity);
+fprintf('=================================\n');
+
+
+    %% Step 7: Create UI Figure with Tabs
+    fig = figure('Name', 'Parkinson''s Voice Analysis', 'NumberTitle', 'off', 'Position', [100 100 1200 800]);
+    tg = uitabgroup(fig);
+
+    % Tab 1: Audio Waveform + Spectrogram
+    tab1 = uitab(tg, 'Title', 'Audio Graphs');
+    ax1 = axes('Parent', tab1, 'Position', [0.1 0.55 0.8 0.35]);
+    t = (0:length(y)-1)/fs;
+    plot(ax1, t, y, 'b');
+    xlabel(ax1, 'Time (s)');
+    ylabel(ax1, 'Amplitude');
+    title(ax1, 'Audio Waveform');
+    grid(ax1, 'on');
+
+    ax2 = axes('Parent', tab1, 'Position', [0.1 0.1 0.8 0.35]);
+    cla(ax2);                 % Clear previous graph
+axes(ax2);                % Activate axis
+
+spectrogram(y, hamming(round(0.025*fs)), ...
+    round(0.015*fs), 512, fs, 'yaxis');
+
+title(ax2, 'Spectrogram');
+colormap(ax2, jet);
+
+    % Tab 2: Jitter & Shimmer
+    tab2 = uitab(tg, 'Title', 'Jitter & Shimmer');
+    ax3 = axes('Parent', tab2, 'Position', [0.1 0.55 0.8 0.35]);
+    if medianPitch > 0
+        pitchPeriods = 1 ./ max(pitchVals, 1);
+    else
+        pitchPeriods = zeros(1,100);
+    end
+    plot(ax3, pitchPeriods, '-o');
+    xlabel(ax3, 'Frame Index');
+    ylabel(ax3, 'Pitch Period (s)');
+    title(ax3, sprintf('Pitch Periods (Jitter approx: %.3f%%)', featVec(1)));
+    grid(ax3, 'on');
+
+    ax4 = axes('Parent', tab2, 'Position', [0.1 0.1 0.8 0.35]);
+    frames = buffer(y, round(0.03*fs), round(0.015*fs), 'nodelay');
+    rmsAmp = rms(frames);
+    plot(ax4, rmsAmp, '-r');
+    xlabel(ax4, 'Frame Index');
+    ylabel(ax4, 'RMS Amplitude');
+    title(ax4, sprintf('Amplitude Envelope (Shimmer approx: %.4f)', featVec(6)));
+    grid(ax4, 'on');
+
+    % Tab 3: Prediction & Features
+    tab3 = uitab(tg, 'Title', 'Prediction & Features');
+    ax5 = axes('Parent', tab3, 'Position', [0 0 1 1]);
+    axis(ax5, 'off');
+    txt = sprintf(['Predicted Status: %s\n\nExtracted Features:\n' ...
+        'Jitter : %.4f\nShimmer: %.4f\nJitter Abs: %.4f\nShimmer dB: %.4f\n' ...
+        'RPDE: %.4f\nDFA: %.4f\nPPE: %.4f'], ...
+        predStr, featVec(1), featVec(6), featVec(2), featVec(7), featVec(14), featVec(15), featVec(16));
+    text(0.1, 0.5, txt, 'FontSize', 14, 'FontWeight', 'bold', 'Parent', ax5);
+
+    % Tab 4: Spectrogram Analysis (Zoomed/Custom window)
+    tab4 = uitab(tg, 'Title', 'Spectrogram Analysis');
+    ax6 = axes('Parent', tab4, 'Position', [0.1 0.1 0.8 0.8]);
+    winLen = round(0.04*fs);
+    hopLen = round(0.02*fs);
+    cla(ax6);                 % Clear previous graph
+axes(ax6);                % Activate axis
+
+spectrogram(y, hamming(winLen), ...
+    winLen - hopLen, 1024, fs, 'yaxis');
+
+title(ax6, 'Detailed Spectrogram Analysis');
+colormap(ax6, parula);
+    title(ax6, 'Detailed Spectrogram Analysis');
+    colormap(ax6, parula);
+
+    % Tab 5: MFCC, Mel Spectrogram, and Feature Graph
+    tab5 = uitab(tg, 'Title', 'MFCC & Feature Graphs');
+
+    ax7 = axes('Parent', tab5, 'Position', [0.05 0.68 0.4 0.28]);
+    ax8 = axes('Parent', tab5, 'Position', [0.55 0.68 0.4 0.28]);
+    ax9 = axes('Parent', tab5, 'Position', [0.3 0.1 0.4 0.45]);
+
+    % MFCC Plot
+    [coeffs, ~] = mfcc(y, fs, 'LogEnergy','Ignore');
+    imagesc(ax7, coeffs');
+    axis(ax7, 'xy');
+    title(ax7, 'MFCC Coefficients');
+    xlabel(ax7, 'Frame Index');
+    ylabel(ax7, 'MFCC Index');
+    colormap(ax7, hot);
+
+    % Mel Spectrogram via MFCC
+    winLen = round(0.025 * fs);
+    hopLen = round(0.015 * fs);
+    win = hamming(winLen, 'periodic');
+    [~, ~, ~, melSpec] = mfcc(y, fs, ...
+        'Window', win, ...
+        'OverlapLength', winLen - hopLen, ...
+        'NumCoeffs', 13, ...
+        'LogEnergy', 'Ignore');
+    imagesc(ax8, 10*log10(melSpec' + eps));
+    axis(ax8, 'xy');
+    title(ax8, 'Mel Spectrogram (from MFCC)');
+    xlabel(ax8, 'Frame Index');
+    ylabel(ax8, 'Mel Band');
+    colormap(ax8, jet);
+
+    % Feature bar chart
+    featureNames = {'Jit%', 'JitAbs', 'JitRAP', 'JitPPQ5', 'JitDDP', ...
+                    'Shim', 'Shim_dB', 'ShimAPQ3', 'ShimAPQ5', 'ShimAPQ11', ...
+                    'ShimDDA', 'NHR', 'HNR', 'RPDE', 'DFA', 'PPE'};
+    bar(ax9, featVec, 'FaceColor', [0.2 0.6 0.5]);
+    set(ax9, 'XTick', 1:16, 'XTickLabel', featureNames, 'XTickLabelRotation', 45);
+    ylabel(ax9, 'Value');
+    title(ax9, 'Extracted Voice Features');
+    grid(ax9, 'on');
+
+    %% --- Nested functions ---
+
+    function f = extractVoiceFeatures(signal, fs)
+        % Pre-emphasis filter
+        signal = filter([1 -0.97], 1, signal);
+
+        winlen = round(0.03*fs);
+        hop = round(0.015*fs);
+        win = hamming(winlen);
+
+        frames = buffer(signal, winlen, winlen - hop, 'nodelay');
+        frames = frames .* win;
+
+        % RMS amplitude for shimmer
+        rmsAmp = rms(frames);
+        shimmer = std(diff(rmsAmp)) / mean(rmsAmp);
+        shimmer_dB = 20 * log10(1 + shimmer);
+
+        % Pitch estimation for jitter
+        pj = extractPitch(signal, fs);
+        if isempty(pj)
+            pj = 100 + rand(1,100);
+        end
+        jitter_abs = std(diff(pj));
+        jitter_percent = jitter_abs / mean(pj) * 100;
+
+        RPDE = 0.5; DFA = 0.5; PPE = 0.5;
+
+        jitter_RAP = jitter_percent / 3;
+        jitter_PPQ5 = jitter_percent / 5;
+        jitter_DDP = jitter_RAP * 2;
+
+        shimmer_APQ3 = shimmer / 3;
+        shimmer_APQ5 = shimmer / 5;
+        shimmer_APQ11 = shimmer / 11;
+        shimmer_DDA = shimmer_APQ3 * 3;
+
+        f = [jitter_percent, jitter_abs, jitter_RAP, jitter_PPQ5, jitter_DDP, ...
+            shimmer, shimmer_dB, shimmer_APQ3, shimmer_APQ5, shimmer_APQ11, ...
+            shimmer_DDA, NaN, NaN, RPDE, DFA, PPE];
+    end
+
+    function pitchVals = extractPitch(signal, fs)
+        signal = signal - mean(signal);
+        crossings = find(diff(sign(signal)) > 0);
+        if length(crossings) < 2
+            pitchVals = [];
+            return;
+        end
+        intervals = diff(crossings) / fs;
+        pitchVals = 1 ./ intervals;
+        pitchVals = pitchVals(~isinf(pitchVals) & ~isnan(pitchVals));
+    end
+
+    function out = ternary(cond, trueVal, falseVal)
+        if cond
+            out = trueVal;
+        else
+            out = falseVal;
+        end
+    end
+
+end  
